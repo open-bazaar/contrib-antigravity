@@ -1,0 +1,93 @@
+"""Register Antigravity as a privately composed BCN Harness."""
+
+from __future__ import annotations
+
+import tomllib
+from contextlib import asynccontextmanager
+from importlib.resources import files
+from pathlib import Path
+from typing import Any, ClassVar
+
+from bazaar_contrib_audit import AUDIT
+from bazaar_contrib_harness import (
+    HARNESS,
+    HARNESS_BUILDERS,
+    HARNESS_INPUT,
+    HarnessBuilderConfig,
+    HarnessInspection,
+    harness_builder_key,
+)
+from bazaar_contrib_timer import TIMER
+from bazaar_core import Context, Contrib
+from pydantic import BaseModel, ConfigDict, Field
+
+from .inspection import inspect
+from .runtime import AntigravityHarness
+
+_LOCALES = Path(str(files(__name__))) / "resources" / "locales"
+
+
+class Config(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        json_schema_extra={
+            "x-locales": {
+                path.stem: tomllib.loads(path.read_text(encoding="utf-8"))
+                for path in sorted(_LOCALES.glob("*.toml"))
+            }
+        },
+    )
+    model: str | None = Field(default=None, json_schema_extra={"x-inspect": "models"})
+    effort: str | None = Field(default=None, json_schema_extra={"x-inspect": "efforts"})
+    api_key: str | None = Field(default=None, json_schema_extra={"writeOnly": True})
+
+
+@asynccontextmanager
+async def lifespan(ctx: Context, config: Config):
+    instance = AntigravityHarness(
+        ctx.accept(HARNESS_INPUT),
+        ctx.accept(TIMER),
+        ctx.accept(AUDIT),
+        config.model,
+        config.effort,
+        config.api_key,
+    )
+    ctx.offer(HARNESS, instance)
+    try:
+        yield
+    finally:
+        await instance.aclose()
+
+
+harness = Contrib(
+    config=Config,
+    accepts=[HARNESS_INPUT, TIMER, AUDIT],
+    offers=[HARNESS],
+    lifespan=lifespan,
+)
+
+
+class BuilderConfig(HarnessBuilderConfig):
+    kind: ClassVar[str] = "antigravity"
+    entity_model: ClassVar[type[BaseModel]] = Config
+    entry: ClassVar[Contrib[Any]] = harness
+
+    @classmethod
+    async def inspect(cls, workspace: Path, *, timeout: float) -> HarnessInspection:  # noqa: ASYNC109
+        return await inspect(workspace, timeout=timeout)
+
+
+@asynccontextmanager
+async def builder_lifespan(ctx: Context, config: BuilderConfig):
+    with ctx.accept(HARNESS_BUILDERS).register(config.builder()) as builder:
+        ctx.offer(harness_builder_key(builder.kind), builder)
+        yield
+
+
+builder = Contrib(
+    config=BuilderConfig,
+    accepts=[HARNESS_BUILDERS],
+    offers=[harness_builder_key("antigravity")],
+    lifespan=builder_lifespan,
+)
