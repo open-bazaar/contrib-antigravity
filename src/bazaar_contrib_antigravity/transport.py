@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -17,6 +18,8 @@ import psutil
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .source import Source
+
+logger = logging.getLogger(__name__)
 
 if sys.platform == "win32":
     from .windows_job import CREATE_SUSPENDED, WindowsJob
@@ -316,8 +319,14 @@ class AcpProcess:
                 result = {"error": {"code": error.code, "message": str(error)}}
             except (ValidationError, KeyError, TypeError, ValueError) as error:
                 result = {"error": {"code": -32602, "message": str(error)}}
-            except (RuntimeError, OSError) as error:
-                result = {"error": {"code": -32603, "message": str(error)}}
+            except Exception as error:
+                logger.exception("Antigravity ACP client request %s failed", packet.id)
+                result = {
+                    "error": {
+                        "code": -32603,
+                        "message": str(error) or type(error).__name__,
+                    }
+                }
             if self.running:
                 await self.send({"id": packet.id, **result})
         except Disconnected:

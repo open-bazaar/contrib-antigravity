@@ -38,6 +38,8 @@ jobs:
         run: uv run --no-sync ruff format --check .
       - name: Types
         run: uv run --no-sync pyright
+      - name: Approval tests
+        run: uv run --no-sync pytest -q tests/test_approval.py
       - name: Process cleanup
         run: uv run --no-sync pytest -q tests/test_process_cleanup.py
       - name: Build
