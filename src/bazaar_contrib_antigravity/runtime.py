@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import logging
 import os
+from collections.abc import Mapping
 from contextlib import suppress
 from importlib.metadata import version
 from math import ceil
@@ -45,7 +48,7 @@ from bazaar_contrib_harness import (
 )
 from bazaar_contrib_timer import Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from watchfiles import awatch
 
 from .events import TurnEvents, Usage, current_option
@@ -58,6 +61,88 @@ from .transport import (
     ProtocolError,
     RpcError,
 )
+
+logger = logging.getLogger(__name__)
+_MAX_APPROVAL_DETAIL = 4_000
+
+
+def _truncate_detail(value: str) -> str:
+    if len(value) > _MAX_APPROVAL_DETAIL:
+        return value[: _MAX_APPROVAL_DETAIL - 1] + "…"
+    return value
+
+
+def _approval_action(
+    tool: Mapping[str, Any], arguments: Mapping[str, Any] | None
+) -> str:
+    if tool.get("name") == "call_mcp_tool" and arguments is not None:
+        server = arguments.get("ServerName")
+        mcp_tool = arguments.get("ToolName")
+        if (
+            isinstance(server, str)
+            and server
+            and isinstance(mcp_tool, str)
+            and mcp_tool
+        ):
+            return f"mcp__{server}__{mcp_tool}"
+    kind = tool.get("kind")
+    if isinstance(kind, str) and kind:
+        return {"execute": "command_execution", "edit": "file_change"}.get(kind, kind)
+    return "tool_permission"
+
+
+def _approval_details(
+    params: Mapping[str, Any],
+    tool: Mapping[str, Any],
+    arguments: Mapping[str, Any] | None,
+    action: str,
+) -> dict[str, JsonValue]:
+    details: dict[str, JsonValue] = dict(params)
+    kind = tool.get("kind")
+    name = tool.get("name")
+    title = tool.get("title")
+    if kind == "execute":
+        command = arguments.get("CommandLine") if arguments is not None else None
+        if not isinstance(command, str) or not command.strip():
+            command = title if isinstance(title, str) else None
+        if isinstance(command, str) and command.strip():
+            details.setdefault("command", _truncate_detail(command.strip()))
+        cwd = arguments.get("Cwd") if arguments is not None else None
+        if isinstance(cwd, str) and cwd.strip():
+            details.setdefault("cwd", cwd.strip())
+        summary = arguments.get("toolSummary") if arguments is not None else None
+        if (
+            isinstance(summary, str)
+            and summary.strip()
+            and summary.strip() != details.get("command")
+        ):
+            details.setdefault("reason", _truncate_detail(summary.strip()))
+        return details
+
+    if isinstance(title, str) and title.strip():
+        details.setdefault("reason", _truncate_detail(title.strip()))
+    if name == "call_mcp_tool":
+        details.setdefault("tool_name", action)
+        raw_input: Any = (
+            arguments.get("Arguments", arguments) if arguments is not None else None
+        )
+    else:
+        if isinstance(name, str) and name.strip():
+            details.setdefault("tool_name", name.strip())
+        raw_input = arguments
+    if raw_input is not None:
+        try:
+            encoded = json.dumps(
+                raw_input,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except TypeError, ValueError:
+            encoded = ""
+        if encoded:
+            details.setdefault("tool_input", _truncate_detail(encoded))
+    return details
 
 
 class Turn:
@@ -77,6 +162,7 @@ class Turn:
         self.pending: set[int] = set()
         self.replies: dict[int, Packet] = {}
         self.finished = False
+        self.completed = False
         self.cancel_requested = False
 
     def __aiter__(self) -> Turn:
@@ -128,6 +214,7 @@ class Turn:
         if self.finished:
             return
         self.finished = True
+        self.completed = isinstance(payload, TurnCompleted)
         self.emit(payload, payload.event_name, packet)
         self.output.put_nowait(None)
         if self.connection.turn is self:
@@ -231,14 +318,21 @@ class Connection:
         cancelled = {"outcome": {"outcome": "cancelled"}}
         if (
             turn is None
-            or turn.finished
             or turn.cancel_requested
-            or packet.params["sessionId"] != self.session.provider_thread_id
+            or (turn.finished and not turn.completed)
+            or packet.params.get("sessionId") != self.session.provider_thread_id
         ):
             return cancelled
 
+        raw_options = packet.params.get("options")
+        if not isinstance(raw_options, list):
+            return cancelled
         options = {
-            option["kind"]: option["optionId"] for option in packet.params["options"]
+            option["kind"]: option["optionId"]
+            for option in raw_options
+            if isinstance(option, dict)
+            and isinstance(option.get("kind"), str)
+            and isinstance(option.get("optionId"), str)
         }
         allow = {
             scope: options[kind]
@@ -251,26 +345,38 @@ class Connection:
         reject = options.get("reject_once") or options.get("reject_always")
         choice = reject
         if allow:
-            tool = packet.params["toolCall"]
-            action = {
-                "execute": "command_execution",
-                "edit": "file_change",
-            }.get(tool.get("kind"), tool.get("kind") or "tool_permission")
-            if tool.get("name") == "call_mcp_tool":
-                arguments = tool["rawInput"]
-                action = f"mcp__{arguments['ServerName']}__{arguments['ToolName']}"
-            result = await turn.approval.request_approval(
-                ApprovalRequest(
-                    request_id=str(packet.id),
-                    session_id=self.session.id,
-                    turn_id=turn.id,
-                    action=action,
-                    details=packet.params,
-                    allowed_scopes=tuple(allow),
-                ),
-                timeout=turn.timeout,
+            raw_tool = packet.params.get("toolCall")
+            tool = raw_tool if isinstance(raw_tool, dict) else {}
+            raw_input = tool.get("rawInput")
+            raw_args = tool.get("args")
+            arguments = (
+                raw_input
+                if isinstance(raw_input, dict)
+                else raw_args
+                if isinstance(raw_args, dict)
+                else None
             )
-            if turn.finished or turn.cancel_requested:
+            action = _approval_action(tool, arguments)
+            details = _approval_details(packet.params, tool, arguments, action)
+            active_before = not turn.finished
+            try:
+                result = await turn.approval.request_approval(
+                    ApprovalRequest(
+                        request_id=str(packet.id),
+                        session_id=self.session.id,
+                        turn_id=turn.id,
+                        action=action,
+                        details=details,
+                        allowed_scopes=tuple(allow),
+                    ),
+                    timeout=turn.timeout,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not handle Antigravity permission request %s", packet.id
+                )
+                return cancelled
+            if turn.cancel_requested or (active_before and turn.finished):
                 return cancelled
             if result.decision == "approved":
                 choice = allow.get(result.scope, reject)
@@ -397,6 +503,8 @@ class AntigravityHarness:
         args = ["agy", "acp", "--process-per-session"]
         if request.sandbox_policy is SandboxPolicy.WORKSPACE_WRITE:
             args.append("--sandbox")
+        elif request.sandbox_policy is SandboxPolicy.DANGER_FULL_ACCESS:
+            args.append("--dangerously-skip-permissions")
         connection = Connection(request, session, usage)
         environment = os.environ | request.environment
         if self.api_key is not None:
@@ -681,7 +789,10 @@ class AntigravityHarness:
         self, session: HarnessSession, *, timeout: float
     ) -> bool:
         connection = self.sessions.get(session.id)
-        return connection is not None and await connection.process.has_background_job()
+        return connection is not None and (
+            bool(connection.process.incoming)
+            or await connection.process.has_background_job()
+        )
 
     async def stop_session(
         self, session: HarnessSession, *, timeout: float
