@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import tomllib
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -46,6 +47,19 @@ workspace = Path(sys.argv[2]).resolve()
 output = root / "steering"
 output.mkdir()
 os.environ.update(json.loads((root / "environment.private.json").read_text()))
+
+
+def harness_config() -> dict[str, Any]:
+    document = tomllib.loads((root / "node.toml").read_text())
+    for package in document["contribs"]:
+        for entry in package["enabled"]:
+            if entry["entry"] == "agent":
+                harness = entry["config"]["agents"][0]["harness"][0]
+                return {key: value for key, value in harness.items() if key != "kind"}
+    raise RuntimeError("Missing agent harness config in node.toml")
+
+
+HARNESS_CONFIG = harness_config()
 events: list[AuditEvent] = []
 recorded: defaultdict[str | None, asyncio.Event] = defaultdict(asyncio.Event)
 exercised = False
@@ -193,7 +207,9 @@ async def main():
                         name="inputs",
                         definition=Contrib(offers=[HARNESS_INPUT], lifespan=inputs),
                     ),
-                    HARNESS_ENTRY,
+                    HARNESS_ENTRY.model_copy(
+                        update={"config": HARNESS_ENTRY.config | HARNESS_CONFIG}
+                    ),
                     ContribEntry(
                         name="exercise",
                         definition=Contrib(accepts=[HARNESS, AUDIT], lifespan=exercise),

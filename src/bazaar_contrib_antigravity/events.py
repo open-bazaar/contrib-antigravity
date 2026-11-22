@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from bazaar_contrib_harness import (
@@ -51,13 +52,40 @@ class Usage:
         )
 
 
+_EXECUTOR_ERROR_PREFIX = "\n⚠ "
+
+
+def _executor_error(data: Mapping[str, Any]) -> str | None:
+    if data.get("sessionUpdate") != "agent_message_chunk":
+        return None
+    content = data.get("content")
+    if not isinstance(content, Mapping) or content.get("type") != "text":
+        return None
+    text = content.get("text")
+    if (
+        isinstance(text, str)
+        and text.startswith(_EXECUTOR_ERROR_PREFIX)
+        and text.endswith("\n")
+    ):
+        message = text.removeprefix(_EXECUTOR_ERROR_PREFIX).removesuffix("\n").strip()
+        if message:
+            return message
+    return None
+
+
 class TurnEvents:
     def __init__(self, usage: Usage) -> None:
         self.usage = usage
         self.tools: dict[str, dict[str, Any]] = {}
+        self.trailing_error: str | None = None
 
     def update(self, data: dict[str, Any]) -> tuple[HarnessEventPayload, ...]:
-        match data["sessionUpdate"]:
+        event = data["sessionUpdate"]
+        if (error := _executor_error(data)) is not None:
+            self.trailing_error = error
+        elif event != "config_option_update":
+            self.trailing_error = None
+        match event:
             case "agent_message_chunk" | "agent_thought_chunk":
                 content = data["content"]
                 if content["type"] == "text":
