@@ -253,7 +253,19 @@ class Turn:
             reason = final.value().get("stopReason")
             match reason:
                 case "end_turn":
-                    terminal = TurnCompleted(event_name="session/prompt")
+                    # agy ACP reports executor errors (such as 429 quota exhaustion)
+                    # as a trailing "\n⚠ <error>\n" agent_message_chunk followed
+                    # immediately by stopReason="end_turn" without a usage_update.
+                    if self.events.trailing_error is not None:
+                        terminal = TurnFailed(
+                            event_name="session/prompt",
+                            failure=HarnessFailure(
+                                HarnessFailureReason.EXECUTION,
+                                self.events.trailing_error,
+                            ),
+                        )
+                    else:
+                        terminal = TurnCompleted(event_name="session/prompt")
                 case "cancelled":
                     terminal = TurnCancelled(event_name="session/prompt")
                 case "max_tokens" | "max_turn_requests" | "refusal":
