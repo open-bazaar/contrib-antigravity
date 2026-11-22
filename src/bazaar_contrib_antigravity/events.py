@@ -53,6 +53,24 @@ class Usage:
 
 
 _EXECUTOR_ERROR_PREFIX = "\n⚠ "
+_SCHEDULE_TITLES = frozenset({"Run schedule", "Running schedule"})
+_SUBAGENT_TITLES = frozenset({"Run invoke_subagent", "Running invoke_subagent"})
+
+
+def _tool_outlives_prompt(record: Mapping[str, Any]) -> bool:
+    raw_input = record.get("rawInput")
+    if isinstance(raw_input, Mapping) and raw_input.get("IsDaemon") is True:
+        return False
+    if record.get("name") == "schedule" or record.get("title") in _SCHEDULE_TITLES:
+        return True
+    return record.get("kind") == "execute"
+
+
+def _is_subagent_launch(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("name") == "invoke_subagent"
+        or record.get("title") in _SUBAGENT_TITLES
+    )
 
 
 def _executor_error(data: Mapping[str, Any]) -> str | None:
@@ -77,7 +95,17 @@ class TurnEvents:
     def __init__(self, usage: Usage) -> None:
         self.usage = usage
         self.tools: dict[str, dict[str, Any]] = {}
+        self.subagent_calls: set[str] = set()
         self.trailing_error: str | None = None
+        self.reply_open = False
+
+    def outliving_tool_ids(self) -> tuple[str, ...]:
+        """Return in-progress non-daemon execute/schedule tool call IDs."""
+        return tuple(
+            call_id
+            for call_id, record in self.tools.items()
+            if record.get("status") == "in_progress" and _tool_outlives_prompt(record)
+        )
 
     def update(self, data: dict[str, Any]) -> tuple[HarnessEventPayload, ...]:
         event = data["sessionUpdate"]
@@ -89,6 +117,8 @@ class TurnEvents:
             case "agent_message_chunk" | "agent_thought_chunk":
                 content = data["content"]
                 if content["type"] == "text":
+                    if content["text"]:
+                        self.reply_open = True
                     kind = (
                         ContentDeltaKind.AGENT_MESSAGE
                         if data["sessionUpdate"] == "agent_message_chunk"
@@ -105,6 +135,7 @@ class TurnEvents:
             case "tool_call" | "tool_call_update":
                 return self.tool(data)
             case "usage_update":
+                self.reply_open = False
                 self.usage.context_window = data["size"]
                 return (self.usage.event(),)
             case "config_option_update":
@@ -118,6 +149,8 @@ class TurnEvents:
         first = call_id not in self.tools
         record = self.tools.setdefault(call_id, {})
         record.update(update)
+        if _is_subagent_launch(record):
+            self.subagent_calls.add(call_id)
         name = record.get("name") or record.get("title") or record.get("kind") or "tool"
         arguments = record.get("rawInput")
         output = record.get("rawOutput")
