@@ -39,7 +39,6 @@ from bazaar_contrib_harness import (
     ModelUpdated,
     ProviderCallResult,
     ProviderCallStatus,
-    QuotaSnapshot,
     SandboxPolicy,
     SessionInput,
     TurnCancelled,
@@ -53,7 +52,6 @@ from pydantic import JsonValue, ValidationError
 from watchfiles import awatch
 
 from .events import TurnEvents, Usage, current_option
-from .quota import read_account_quota
 from .source import Source
 from .state import (
     StepErrorOutcome,
@@ -1033,15 +1031,6 @@ class AntigravityHarness:
 
     async def receive_event(self) -> HarnessExpire:
         return await self.lifecycle.get()
-
-    async def read_quota(self) -> QuotaSnapshot | None:
-        if self.api_key is not None:
-            return None
-        return await read_account_quota(
-            self.input.workspace,
-            timer=self.timer,
-            timeout=self.input.startup_timeout,
-        )
 
     async def watch_files(self, session_id: str, paths: tuple[Path, ...]) -> None:
         async for _ in awatch(*paths):
