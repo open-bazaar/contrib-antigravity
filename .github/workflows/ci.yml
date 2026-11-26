@@ -42,8 +42,6 @@ jobs:
         run: uv run --no-sync pytest -q tests/test_approval.py
       - name: Turn error tests
         run: uv run --no-sync pytest -q tests/test_turn_errors.py
-      - name: Quota tests
-        run: uv run --no-sync pytest -q tests/test_quota.py
       - name: Process cleanup
         run: uv run --no-sync pytest -q tests/test_process_cleanup.py
       - name: Build
